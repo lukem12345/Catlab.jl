@@ -2,17 +2,14 @@
 #
 #md # [![](https://img.shields.io/badge/show-nbviewer-579ACA.svg)](@__NBVIEWER_ROOT_URL__/generated/sketches/meets.ipynb)
 #
-# Our first example of a concept defined by a universal mapping property is a meet respectively meet.
-# 
+# Our first example of a concept defined by a universal mapping property is a meet.
+# We represent each preorder as a `PreorderFinCat`, a thin category whose morphism
+# set is the *transitive closure* of the covering relation.
+#
 
-# The first step is our Catlab imports
-using Core: GeneratedFunctionStub
 using Test
 
 using Catlab.Theories, Catlab.CategoricalAlgebra, Catlab.Graphics
-import Catlab.Theories: compose
-
-using DataStructures
 
 # # Defining some basic preorders
 
@@ -28,157 +25,136 @@ end
 
 to_graphviz(P)
 
-# It will be convenient to program with our preorders based on the Hasse Diagram
-# represent as a labeled graph so we convert the Presentation{Schema, Symbol} into a FreeDiagram.
-# FreeDiagrams are implemented as an ACSet which you can think of as an in-memory database.
-# ACSets are a key feature of Catlab that allow you to represent many data structures in a
-# common framework.
+# ## Representing a Preorder as a Category
+#
+# A preorder is a *thin category*: at most one morphism between any two objects,
+# with morphism existence encoding the ≤ relation.  Catlab's `PreorderFinCat` builds
+# this thin category by computing the *transitive closure* of the covering relation
+# at construction time.  Internally it calls `enumerate_paths` (from `Catlab.Graphs`)
+# on the Hasse-diagram DAG and records every reachable pair (i, j) — including
+# reflexive ones — in the `rel` field as a `Set{Pair{Int,Int}}`.  An entry `i => j`
+# means `genvec[i] ≤ genvec[j]`, where `genvec` is the sorted vector of object names.
 
-g = FreeDiagram(P)
-
-# To give ourselves a graph-like API for Hasse Diagrams, we define parents and children.
-
-parents(g, y::Int) = subpart(g, incident(g, y, :tgt), :src)
-children(g, x::Int) = subpart(g, incident(g, x, :src), :tgt)
-
-# We can compute upsets/downsets with breadth first search.
-
-function bfs(g, x::Int, f=children)
-  explored = falses(nparts(g, :V))
-  explored[x] = 1
-  q = Queue{Int}()
-  enqueue!(q, x)
-  while !isempty(q)
-    v = dequeue!(q)
-    S = f(g,v)
-    map(filter(s -> !explored[s], S)) do s
-      enqueue!(q, s)
-    end
-    explored[S] .= true
-  end
-  return findall(explored)
+function build_preorder(P::Presentation)
+  pairs = [nameof(dom(f)) => nameof(codom(f)) for f in generators(P, :Hom)]
+  PreorderFinCat(pairs)
 end
 
-# The upset of a preorder element is all the elements that come after it in the preorder.
+pfc = build_preorder(P)
 
-upset(g,x) = bfs(getvalue(g),x,children)
+# Inspect the object ordering and the transitive closure:
 
-# The downset is the dual notion, which we compute by reversing the role of children and parents.
+pfc.genvec   # [:a₁, :a₂, :a₃, :a₄]
 
-downset(g::FreeDiagram,x) = bfs(getvalue(g),x,parents)
+pfc.rel      # {1=>1, 1=>2, 1=>3, 1=>4, 2=>2, 2=>4, 3=>3, 3=>4, 4=>4}
 
-upset(g, 1)
+# ## Downsets and Upsets via Relational Lookup
+#
+# Because the full order relation is precomputed in `pfc.rel`, upsets and downsets
+# reduce to simple filter queries on that set — no graph traversal at query time.
 
-# We can use upsets to define the less than or equal two relation implied by any Hasse Diagram
+# The *downset* ↓x = { y ∣ y ≤ x }:
+function downset(pfc::PreorderFinCat, x::Symbol)
+  xj = pfc.gendict[x]
+  sort([pfc.genvec[i] for (i, j) in pfc.rel if j == xj])
+end
 
-function leq(g::FreeDiagram, x::Int, y::Int)
-  return y in upset(g, x)
+# The *upset* ↑x = { y ∣ x ≤ y }:
+function upset(pfc::PreorderFinCat, x::Symbol)
+  xi = pfc.gendict[x]
+  sort([pfc.genvec[j] for (i, j) in pfc.rel if i == xi])
+end
+
+upset(pfc, :a₁)
+
+# The ≤ relation is an O(1) average-time membership test on the `rel` hash set:
+function leq(pfc::PreorderFinCat, x::Symbol, y::Symbol)
+  (pfc.gendict[x] => pfc.gendict[y]) in pfc.rel
 end
 
 # ### Exercise 1
-# Define a more efficient algorithm for checking whether two elements satisfy the leq relation.
+# The `leq` above is already O(1) thanks to the precomputed transitive closure.
+# By contrast, a BFS-based approach recomputes reachability on every call.
+# Verify experimentally that `leq` here has constant-time behaviour by
+# benchmarking it on increasingly large preorders (e.g. total orders of length n).
 
-# Multiple dispatch allows us to overload the leq function with another method for symbols.
+# ## Meet (Greatest Lower Bound)
+#
+# The meet x ∧ y is the largest element in downset(x) ∩ downset(y).
+# With the full closure in `pfc.rel`, maximality is a direct relational query.
 
-function leq(g::FreeDiagram, x::Symbol, y::Symbol)
-  g = getvalue(g)
-  leq(g, incident(g, x, :ob), incident(g, y, :ob))
-end
-
-
-# the meet of two elements is the largest element in the intersection of their downsets.
-
-function meet(g::FreeDiagram, x::Int, y::Int)
-  U = downset(g, x) ∩ downset(g,y)
-  maxima(g, U)
-  return maximum(g, U)
-end
-
-function meet(g::FreeDiagram, x, y)
-  meet(g, incident(g, x, :ob)[1], incident(g, y, :ob)[1])
-end
-
-# assuming that D is a downset, the maxima are those elements whose children are disjoint from D.
-
-function maxima(g::FreeDiagram, D::Vector{Int})
-  X = Set(D)
-  M = filter(D) do x
-    Pₓ = children(getvalue(g), x) ∩ X
-    length(Pₓ) == 0
-  end
-  return M
-end
-
-function hastop(g::FreeDiagram, xs::Vector{Int})
-  length(maxima(g, xs)) == 1
-end
-
-function maximum(g::FreeDiagram, xs::Vector{Int})
-  m = maxima(g, xs::Vector{Int})
-  if length(m) == 1
-    return m[1]
-  end
-  if length(m) > 1
-    all_iso = all(m) do a
-      Uₐ = downset(g, a) 
-      a_le_allb = all(m) do b
-        b in Uₐ
-      end
-      return a_le_allb
-    end
-    if all_iso 
-      return  m[1]
+# An element m ∈ D is *maximal* if no other element of D lies strictly above it:
+function maxima(pfc::PreorderFinCat, D::AbstractVector{Symbol})
+  filter(D) do x
+    xi = pfc.gendict[x]
+    !any(D) do y
+      y != x && (xi => pfc.gendict[y]) in pfc.rel
     end
   end
-  return nothing
 end
 
-# From the definition of minimum, you can see that when you want to do many leq queries
-# in sequence, you can reuse the upsets that you compute with bfs. This is a place where
-# mathematical abstractions don't work well with the operational needs of computer programming.
-# In a mathematical definition you can define x ≤ y as y ∈ upset(x), but in programming, that is
-# inefficient when you want to check a property like for all y in Y, x ≤ y. Programming requires
-# you to reason about not only the correctness of the code, but also the performance. Much of the
-# complexity of software engineering comes from the fact that computational performance requires
-# the programmers to break down their clean abstractions to optimize the code.
+function hastop(pfc::PreorderFinCat, D::AbstractVector{Symbol})
+  length(maxima(pfc, D)) == 1
+end
+
+# In a preorder (not necessarily a poset) there may be several mutually isomorphic
+# maxima (each ≤ the other).  `maximum_elt` returns the canonical first one, or
+# `nothing` if the set has no greatest element.
+function maximum_elt(pfc::PreorderFinCat, D::AbstractVector{Symbol})
+  m = maxima(pfc, D)
+  isempty(m) && return nothing
+  length(m) == 1 && return m[1]
+  # All maxima must be mutually isomorphic for a unique equivalence class to exist.
+  all_iso = all(m) do a
+    ai = pfc.gendict[a]
+    all(b -> (ai => pfc.gendict[b]) in pfc.rel, m)
+  end
+  all_iso ? m[1] : nothing
+end
+
+function meet(pfc::PreorderFinCat, x::Symbol, y::Symbol)
+  D = intersect(downset(pfc, x), downset(pfc, y))
+  maximum_elt(pfc, D)
+end
+
+# Because `pfc.rel` is built once at construction and every `leq` check inside
+# `maximum_elt` is O(1), repeated meet queries on the same preorder reuse the
+# transitive closure without additional graph traversal.
 
 # ### Exercise 2
-# If you wanted to perform many x ≤ y queries in a loop, you might want to 
-# precompute the matrix L where L[i,j] = 1 if and only if i ≤ j in the preorder P.
-# Implement an algorithm that performs this computation in O(V⋅E) time where V is the number of
-# elements in P and E is the number of edges in the corresponding FreeDiagram.
+# Implement `leq_matrix(pfc)` returning a Boolean matrix L where L[i,j] is true
+# iff `pfc.genvec[i] ≤ pfc.genvec[j]`.  What is the time and space complexity
+# of building it directly from `pfc.rel`?
 
 # ## Testing it out
 
-# Let's make sure we get the answers that we expect.
-
-using Test
 @testset "Upsets" begin
-  @test upset(g, 3) == [3,4]
-  @test upset(g, 2) == [2,4]
-  @test upset(g, 1) == [1,2,3,4]
-  @test upset(g, 4) == [4] 
+  @test upset(pfc, :a₃) == [:a₃, :a₄]
+  @test upset(pfc, :a₂) == [:a₂, :a₄]
+  @test upset(pfc, :a₁) == [:a₁, :a₂, :a₃, :a₄]
+  @test upset(pfc, :a₄) == [:a₄]
 end
+
 @testset "Downsets" begin
-  @test downset(g, 3) == [1,3]
-  @test downset(g, 2) == [1,2]
-  @test downset(g, 4) == [1,2,3,4]
-  @test downset(g, 1) == [1] 
+  @test downset(pfc, :a₃) == [:a₁, :a₃]
+  @test downset(pfc, :a₂) == [:a₁, :a₂]
+  @test downset(pfc, :a₄) == [:a₁, :a₂, :a₃, :a₄]
+  @test downset(pfc, :a₁) == [:a₁]
 end
 
 @testset "Meets" begin
-  @test meet(g, 2,3) == 1
-  @test meet(g, 1,2) == 1
-  @test meet(g, 3,4) == 3
-  @test meet(g, 1, 4) == 1
-  @test meet(g, 1, 1) == 1
-  @test meet(g, 2, 2) == 2
+  @test meet(pfc, :a₂, :a₃) == :a₁
+  @test meet(pfc, :a₁, :a₂) == :a₁
+  @test meet(pfc, :a₃, :a₄) == :a₃
+  @test meet(pfc, :a₁, :a₄) == :a₁
+  @test meet(pfc, :a₁, :a₁) == :a₁
+  @test meet(pfc, :a₂, :a₂) == :a₂
 end
 
 # ## Another Example:
 
 @present P(FreeSchema) begin
-  (a₁,a₂,a₃,a₄, a₅)::Ob
+  (a₁,a₂,a₃,a₄,a₅)::Ob
   f::Hom(a₁, a₂)
   g::Hom(a₁, a₃)
   h::Hom(a₂, a₄)
@@ -190,27 +166,26 @@ end
 
 to_graphviz(P)
 
-# Or, as tables:
+# Rebuild the preorder category for the new presentation:
 
-g = FreeDiagram(P)
+pfc = build_preorder(P)
 
 # ### Test suite
 
 @testset "meets2" begin
-  @test meet(g, 2,3) == 1
-  @test meet(g, 1,2) == 1
-  @test meet(g, 3,4) == 3
-  @test meet(g, 1, 4) == 1
-  @test meet(g, 1, 1) == 1
-  @test meet(g, 2, 2) == 2
-  @test meet(g, 3, 5) == nothing
-  @test meet(g, 2, 5) == 5
+  @test meet(pfc, :a₂, :a₃) == :a₁
+  @test meet(pfc, :a₁, :a₂) == :a₁
+  @test meet(pfc, :a₃, :a₄) == :a₃
+  @test meet(pfc, :a₁, :a₄) == :a₁
+  @test meet(pfc, :a₁, :a₁) == :a₁
+  @test meet(pfc, :a₂, :a₂) == :a₂
+  @test meet(pfc, :a₃, :a₅) == nothing
+  @test meet(pfc, :a₂, :a₅) == :a₅
 end
 
 # ### Exercise 3
-# Make bigger preorders to test corner cases in the above code. 
+# Make bigger preorders to test corner cases in the above code.
 # If you find an example that breaks these implementations, please report it.
- 
 
 # ### Exercise 4
 # Implement the dual constructions for joins.
