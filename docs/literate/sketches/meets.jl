@@ -3,13 +3,16 @@
 #md # [![](https://img.shields.io/badge/show-nbviewer-579ACA.svg)](@__NBVIEWER_ROOT_URL__/generated/sketches/meets.ipynb)
 #
 # Our first example of a concept defined by a universal mapping property is a meet.
-# We represent each preorder as a `PreorderFinCat`, a thin category whose morphism
-# set is the *transitive closure* of the covering relation.
 #
 
 using Test
 
 using Catlab.Theories, Catlab.CategoricalAlgebra, Catlab.Graphics
+
+# `bfs_parents` performs breadth-first search on any ACSet graph.  It is
+# more efficient than a hand-rolled BFS because it pre-allocates a single
+# integer parent vector instead of using a separate queue and visited set.
+using Catlab.Graphs: bfs_parents, outneighbors
 
 # # Defining some basic preorders
 
@@ -25,130 +28,131 @@ end
 
 to_graphviz(P)
 
-# ## Representing a Preorder as a Category
+# It is convenient to program with preorders using their Hasse diagram
+# representation as a labeled graph, so we convert the
+# `Presentation{Schema, Symbol}` into a `FreeDiagram`.  `FreeDiagram`s are
+# implemented as ACSets, Catlab's in-memory relational database format.
+
+g = FreeDiagram(P)
+
+# ## Downsets and Upsets
 #
-# A preorder is a *thin category*: at most one morphism between any two objects,
-# with morphism existence encoding the ≤ relation.  Catlab's `PreorderFinCat` builds
-# this thin category by computing the *transitive closure* of the covering relation
-# at construction time.  Internally it calls `enumerate_paths` (from `Catlab.Graphs`)
-# on the Hasse-diagram DAG and records every reachable pair (i, j) — including
-# reflexive ones — in the `rel` field as a `Set{Pair{Int,Int}}`.  An entry `i => j`
-# means `genvec[i] ≤ genvec[j]`, where `genvec` is the sorted vector of object names.
-
-function build_preorder(P::Presentation)
-  pairs = [nameof(dom(f)) => nameof(codom(f)) for f in generators(P, :Hom)]
-  PreorderFinCat(pairs)
-end
-
-pfc = build_preorder(P)
-
-# Inspect the object ordering and the transitive closure:
-
-pfc.genvec   # [:a₁, :a₂, :a₃, :a₄]
-
-pfc.rel      # {1=>1, 1=>2, 1=>3, 1=>4, 2=>2, 2=>4, 3=>3, 3=>4, 4=>4}
-
-# ## Downsets and Upsets via Relational Lookup
+# `bfs_parents(acset, s; dir)` returns a length-`nv` parent vector: entry `v`
+# is nonzero iff vertex `v` was reached during BFS from `s`.  The `dir` keyword
+# controls which edge endpoints are followed:
 #
-# Because the full order relation is precomputed in `pfc.rel`, upsets and downsets
-# reduce to simple filter queries on that set — no graph traversal at query time.
+# * `dir=:out` follows each edge source → target, so the reachable set is the
+#   *upset* ↑s = { y | s ≤ y }.
+# * `dir=:in`  follows edges backwards (target → source), so the reachable set
+#   is the *downset* ↓s = { y | y ≤ s }.
+#
+# `findall(!iszero, parents)` collects reachable vertex indices in sorted order,
+# since `bfs_parents` explores each BFS frontier in sorted order.
 
-# The *downset* ↓x = { y ∣ y ≤ x }:
-function downset(pfc::PreorderFinCat, x::Symbol)
-  xj = pfc.gendict[x]
-  sort([pfc.genvec[i] for (i, j) in pfc.rel if j == xj])
+function upset(g::FreeDiagram, x::Int)
+  findall(!iszero, bfs_parents(getvalue(g), x; dir=:out))
 end
 
-# The *upset* ↑x = { y ∣ x ≤ y }:
-function upset(pfc::PreorderFinCat, x::Symbol)
-  xi = pfc.gendict[x]
-  sort([pfc.genvec[j] for (i, j) in pfc.rel if i == xi])
+function downset(g::FreeDiagram, x::Int)
+  findall(!iszero, bfs_parents(getvalue(g), x; dir=:in))
 end
 
-upset(pfc, :a₁)
+upset(g, 1)
 
-# The ≤ relation is an O(1) average-time membership test on the `rel` hash set:
-function leq(pfc::PreorderFinCat, x::Symbol, y::Symbol)
-  (pfc.gendict[x] => pfc.gendict[y]) in pfc.rel
+# We can use upsets to define the ≤ relation implied by any Hasse diagram.
+
+function leq(g::FreeDiagram, x::Int, y::Int)
+  y in upset(g, x)
+end
+
+# Multiple dispatch lets us also query by object name.
+
+function leq(g::FreeDiagram, x::Symbol, y::Symbol)
+  inner = getvalue(g)
+  leq(g, incident(inner, x, :ob)[1], incident(inner, y, :ob)[1])
 end
 
 # ### Exercise 1
-# The `leq` above is already O(1) thanks to the precomputed transitive closure.
-# By contrast, a BFS-based approach recomputes reachability on every call.
-# Verify experimentally that `leq` here has constant-time behaviour by
-# benchmarking it on increasingly large preorders (e.g. total orders of length n).
+# `leq` as written recomputes the full upset of `x` just to test membership of `y`.
+# Define a more efficient algorithm that stops BFS as soon as `y` is discovered.
 
 # ## Meet (Greatest Lower Bound)
 #
-# The meet x ∧ y is the largest element in downset(x) ∩ downset(y).
-# With the full closure in `pfc.rel`, maximality is a direct relational query.
+# The meet of two elements is the largest element in the intersection of their downsets.
 
-# An element m ∈ D is *maximal* if no other element of D lies strictly above it:
-function maxima(pfc::PreorderFinCat, D::AbstractVector{Symbol})
+function meet(g::FreeDiagram, x::Int, y::Int)
+  D = downset(g, x) ∩ downset(g, y)
+  return maximum(g, D)
+end
+
+function meet(g::FreeDiagram, x, y)
+  meet(g, incident(getvalue(g), x, :ob)[1], incident(getvalue(g), y, :ob)[1])
+end
+
+# An element of a downset D is *maximal* if none of its out-neighbours
+# are also in D.
+
+function maxima(g::FreeDiagram, D::Vector{Int})
+  X = Set(D)
   filter(D) do x
-    xi = pfc.gendict[x]
-    !any(D) do y
-      y != x && (xi => pfc.gendict[y]) in pfc.rel
+    isempty(outneighbors(getvalue(g), x) ∩ X)
+  end
+end
+
+function hastop(g::FreeDiagram, xs::Vector{Int})
+  length(maxima(g, xs)) == 1
+end
+
+# In a preorder (not necessarily a poset) there may be several mutually
+# isomorphic maxima.  `maximum` returns the canonical first one, or `nothing`.
+
+function maximum(g::FreeDiagram, xs::Vector{Int})
+  m = maxima(g, xs)
+  if length(m) == 1
+    return m[1]
+  end
+  if length(m) > 1
+    all_iso = all(m) do a
+      a_le_allb = all(b -> b in upset(g, a), m)
+      return a_le_allb
     end
+    all_iso && return m[1]
   end
+  return nothing
 end
 
-function hastop(pfc::PreorderFinCat, D::AbstractVector{Symbol})
-  length(maxima(pfc, D)) == 1
-end
-
-# In a preorder (not necessarily a poset) there may be several mutually isomorphic
-# maxima (each ≤ the other).  `maximum_elt` returns the canonical first one, or
-# `nothing` if the set has no greatest element.
-function maximum_elt(pfc::PreorderFinCat, D::AbstractVector{Symbol})
-  m = maxima(pfc, D)
-  isempty(m) && return nothing
-  length(m) == 1 && return m[1]
-  # All maxima must be mutually isomorphic for a unique equivalence class to exist.
-  all_iso = all(m) do a
-    ai = pfc.gendict[a]
-    all(b -> (ai => pfc.gendict[b]) in pfc.rel, m)
-  end
-  all_iso ? m[1] : nothing
-end
-
-function meet(pfc::PreorderFinCat, x::Symbol, y::Symbol)
-  D = intersect(downset(pfc, x), downset(pfc, y))
-  maximum_elt(pfc, D)
-end
-
-# Because `pfc.rel` is built once at construction and every `leq` check inside
-# `maximum_elt` is O(1), repeated meet queries on the same preorder reuse the
-# transitive closure without additional graph traversal.
+# Because `bfs_parents` is backed by Catlab's ACSet index, each call to
+# `downset` or `upset` avoids rebuilding neighbour lists from scratch.
+# If you need to perform many ≤ queries in a tight loop, see Exercise 2.
 
 # ### Exercise 2
-# Implement `leq_matrix(pfc)` returning a Boolean matrix L where L[i,j] is true
-# iff `pfc.genvec[i] ≤ pfc.genvec[j]`.  What is the time and space complexity
-# of building it directly from `pfc.rel`?
+# Precompute the reachability matrix L where L[i,j] = 1 iff i ≤ j.
+# One approach: call `upset(g, v)` for each vertex v and collect results.
+# What is the time complexity compared to running one BFS per query?
 
 # ## Testing it out
 
 @testset "Upsets" begin
-  @test upset(pfc, :a₃) == [:a₃, :a₄]
-  @test upset(pfc, :a₂) == [:a₂, :a₄]
-  @test upset(pfc, :a₁) == [:a₁, :a₂, :a₃, :a₄]
-  @test upset(pfc, :a₄) == [:a₄]
+  @test upset(g, 3) == [3,4]
+  @test upset(g, 2) == [2,4]
+  @test upset(g, 1) == [1,2,3,4]
+  @test upset(g, 4) == [4]
 end
 
 @testset "Downsets" begin
-  @test downset(pfc, :a₃) == [:a₁, :a₃]
-  @test downset(pfc, :a₂) == [:a₁, :a₂]
-  @test downset(pfc, :a₄) == [:a₁, :a₂, :a₃, :a₄]
-  @test downset(pfc, :a₁) == [:a₁]
+  @test downset(g, 3) == [1,3]
+  @test downset(g, 2) == [1,2]
+  @test downset(g, 4) == [1,2,3,4]
+  @test downset(g, 1) == [1]
 end
 
 @testset "Meets" begin
-  @test meet(pfc, :a₂, :a₃) == :a₁
-  @test meet(pfc, :a₁, :a₂) == :a₁
-  @test meet(pfc, :a₃, :a₄) == :a₃
-  @test meet(pfc, :a₁, :a₄) == :a₁
-  @test meet(pfc, :a₁, :a₁) == :a₁
-  @test meet(pfc, :a₂, :a₂) == :a₂
+  @test meet(g, 2,3) == 1
+  @test meet(g, 1,2) == 1
+  @test meet(g, 3,4) == 3
+  @test meet(g, 1, 4) == 1
+  @test meet(g, 1, 1) == 1
+  @test meet(g, 2, 2) == 2
 end
 
 # ## Another Example:
@@ -166,21 +170,21 @@ end
 
 to_graphviz(P)
 
-# Rebuild the preorder category for the new presentation:
+# Or, as tables:
 
-pfc = build_preorder(P)
+g = FreeDiagram(P)
 
 # ### Test suite
 
 @testset "meets2" begin
-  @test meet(pfc, :a₂, :a₃) == :a₁
-  @test meet(pfc, :a₁, :a₂) == :a₁
-  @test meet(pfc, :a₃, :a₄) == :a₃
-  @test meet(pfc, :a₁, :a₄) == :a₁
-  @test meet(pfc, :a₁, :a₁) == :a₁
-  @test meet(pfc, :a₂, :a₂) == :a₂
-  @test meet(pfc, :a₃, :a₅) == nothing
-  @test meet(pfc, :a₂, :a₅) == :a₅
+  @test meet(g, 2,3) == 1
+  @test meet(g, 1,2) == 1
+  @test meet(g, 3,4) == 3
+  @test meet(g, 1, 4) == 1
+  @test meet(g, 1, 1) == 1
+  @test meet(g, 2, 2) == 2
+  @test meet(g, 3, 5) == nothing
+  @test meet(g, 2, 5) == 5
 end
 
 # ### Exercise 3
