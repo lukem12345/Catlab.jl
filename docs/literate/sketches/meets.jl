@@ -9,10 +9,9 @@ using Test
 
 using Catlab.Theories, Catlab.CategoricalAlgebra, Catlab.Graphics
 
-# `bfs_parents` performs breadth-first search on any ACSet graph.  It is
-# more efficient than a hand-rolled BFS because it pre-allocates a single
-# integer parent vector instead of using a separate queue and visited set.
-using Catlab.Graphs: bfs_parents, outneighbors
+# `enumerate_paths` from `Catlab.Graphs` computes all paths in a DAG via a
+# single topological-order sweep — no breadth-first search involved.
+using Catlab.Graphs: enumerate_paths
 
 # # Defining some basic preorders
 
@@ -35,124 +34,115 @@ to_graphviz(P)
 
 g = FreeDiagram(P)
 
+# ## Building the Reachability Relation
+#
+# `enumerate_paths(G)` topologically sorts the DAG and then accumulates, for
+# each vertex `v` in reverse topological order, the set of all paths that
+# start at `v`.  The output is a `ReflexiveEdgePropertyGraph` in which every
+# edge `(s, t, edge_list)` records one path from `s` to `t`; reflexive edges
+# (the `refl` part of the schema) encode the trivial length-0 path `s = t`.
+#
+# The reachability relation is the image of this graph under `(src, tgt)`:
+# a pair `(s, t)` is in the relation iff there is some path from `s` to `t`,
+# i.e. iff `s ≤ t` in the preorder.
+
+function reachability(g::FreeDiagram)
+  ps = enumerate_paths(getvalue(g))
+  Set(s => t for (s, t, e) in zip(ps[:src], ps[:tgt], ps[:eprops])
+             if s == t || !isempty(e))
+end
+
+reach = reachability(g)
+
 # ## Downsets and Upsets
 #
-# `bfs_parents(acset, s; dir)` returns a length-`nv` parent vector: entry `v`
-# is nonzero iff vertex `v` was reached during BFS from `s`.  The `dir` keyword
-# controls which edge endpoints are followed:
-#
-# * `dir=:out` follows each edge source → target, so the reachable set is the
-#   *upset* ↑s = { y | s ≤ y }.
-# * `dir=:in`  follows edges backwards (target → source), so the reachable set
-#   is the *downset* ↓s = { y | y ≤ s }.
-#
-# `findall(!iszero, parents)` collects reachable vertex indices in sorted order,
-# since `bfs_parents` explores each BFS frontier in sorted order.
+# With the full order relation precomputed, upsets and downsets are simple
+# filter queries on `reach` — no graph traversal at query time.
 
-function upset(g::FreeDiagram, x::Int)
-  findall(!iszero, bfs_parents(getvalue(g), x; dir=:out))
+# The *downset* ↓x = { y | y ≤ x } consists of all sources of paths that end at x:
+function downset(reach::Set{Pair{Int,Int}}, x::Int)
+  sort([s for (s, t) in reach if t == x])
 end
 
-function downset(g::FreeDiagram, x::Int)
-  findall(!iszero, bfs_parents(getvalue(g), x; dir=:in))
+# The *upset* ↑x = { y | x ≤ y } consists of all targets of paths that start at x:
+function upset(reach::Set{Pair{Int,Int}}, x::Int)
+  sort([t for (s, t) in reach if s == x])
 end
 
-upset(g, 1)
+upset(reach, 1)
 
-# We can use upsets to define the ≤ relation implied by any Hasse diagram.
-
-function leq(g::FreeDiagram, x::Int, y::Int)
-  y in upset(g, x)
-end
-
-# Multiple dispatch lets us also query by object name.
-
-function leq(g::FreeDiagram, x::Symbol, y::Symbol)
-  inner = getvalue(g)
-  leq(g, incident(inner, x, :ob)[1], incident(inner, y, :ob)[1])
-end
+# The ≤ relation is an O(1) membership test on the hash set:
+leq(reach::Set{Pair{Int,Int}}, x::Int, y::Int) = (x => y) in reach
 
 # ### Exercise 1
-# `leq` as written recomputes the full upset of `x` just to test membership of `y`.
-# Define a more efficient algorithm that stops BFS as soon as `y` is discovered.
+# `leq` is already O(1).  A BFS-based approach would recompute a traversal
+# per call; here the cost is paid once in `reachability`.  Try implementing
+# a version that builds `reach` lazily — only computing the rows it needs.
 
 # ## Meet (Greatest Lower Bound)
 #
 # The meet of two elements is the largest element in the intersection of their downsets.
 
-function meet(g::FreeDiagram, x::Int, y::Int)
-  D = downset(g, x) ∩ downset(g, y)
-  return maximum(g, D)
+function meet(reach::Set{Pair{Int,Int}}, x::Int, y::Int)
+  D = downset(reach, x) ∩ downset(reach, y)
+  maximum_elt(reach, D)
 end
 
-function meet(g::FreeDiagram, x, y)
-  meet(g, incident(getvalue(g), x, :ob)[1], incident(getvalue(g), y, :ob)[1])
-end
+# An element m ∈ D is *maximal* if no other element of D lies strictly above it.
+# Using `reach` we can check this directly without inspecting graph edges:
 
-# An element of a downset D is *maximal* if none of its out-neighbours
-# are also in D.
-
-function maxima(g::FreeDiagram, D::Vector{Int})
-  X = Set(D)
+function maxima(reach::Set{Pair{Int,Int}}, D::Vector{Int})
   filter(D) do x
-    isempty(outneighbors(getvalue(g), x) ∩ X)
+    !any(y -> y != x && (x => y) in reach, D)
   end
 end
 
-function hastop(g::FreeDiagram, xs::Vector{Int})
-  length(maxima(g, xs)) == 1
+function hastop(reach::Set{Pair{Int,Int}}, D::Vector{Int})
+  length(maxima(reach, D)) == 1
 end
 
 # In a preorder (not necessarily a poset) there may be several mutually
-# isomorphic maxima.  `maximum` returns the canonical first one, or `nothing`.
-
-function maximum(g::FreeDiagram, xs::Vector{Int})
-  m = maxima(g, xs)
-  if length(m) == 1
-    return m[1]
-  end
-  if length(m) > 1
-    all_iso = all(m) do a
-      a_le_allb = all(b -> b in upset(g, a), m)
-      return a_le_allb
-    end
-    all_iso && return m[1]
-  end
-  return nothing
+# isomorphic maxima (each ≤ the other).  `maximum_elt` returns the canonical
+# first one, or `nothing` if the set has no greatest element.
+function maximum_elt(reach::Set{Pair{Int,Int}}, D::Vector{Int})
+  m = maxima(reach, D)
+  isempty(m) && return nothing
+  length(m) == 1 && return m[1]
+  all_iso = all(a -> all(b -> (a => b) in reach, m), m)
+  all_iso ? m[1] : nothing
 end
 
-# Because `bfs_parents` is backed by Catlab's ACSet index, each call to
-# `downset` or `upset` avoids rebuilding neighbour lists from scratch.
-# If you need to perform many ≤ queries in a tight loop, see Exercise 2.
+# Because `reach` is computed once by `enumerate_paths` and all subsequent
+# operations are set queries, the cost of each downset, upset, leq, or meet
+# call is proportional to `|reach|`, not to the structure of the graph.
 
 # ### Exercise 2
-# Precompute the reachability matrix L where L[i,j] = 1 iff i ≤ j.
-# One approach: call `upset(g, v)` for each vertex v and collect results.
-# What is the time complexity compared to running one BFS per query?
+# Precompute the full reachability matrix L where L[i,j] = 1 iff i ≤ j.
+# Using `reach`, this is a single pass over the set.  What is the complexity?
 
 # ## Testing it out
 
 @testset "Upsets" begin
-  @test upset(g, 3) == [3,4]
-  @test upset(g, 2) == [2,4]
-  @test upset(g, 1) == [1,2,3,4]
-  @test upset(g, 4) == [4]
+  @test upset(reach, 3) == [3,4]
+  @test upset(reach, 2) == [2,4]
+  @test upset(reach, 1) == [1,2,3,4]
+  @test upset(reach, 4) == [4]
 end
 
 @testset "Downsets" begin
-  @test downset(g, 3) == [1,3]
-  @test downset(g, 2) == [1,2]
-  @test downset(g, 4) == [1,2,3,4]
-  @test downset(g, 1) == [1]
+  @test downset(reach, 3) == [1,3]
+  @test downset(reach, 2) == [1,2]
+  @test downset(reach, 4) == [1,2,3,4]
+  @test downset(reach, 1) == [1]
 end
 
 @testset "Meets" begin
-  @test meet(g, 2,3) == 1
-  @test meet(g, 1,2) == 1
-  @test meet(g, 3,4) == 3
-  @test meet(g, 1, 4) == 1
-  @test meet(g, 1, 1) == 1
-  @test meet(g, 2, 2) == 2
+  @test meet(reach, 2,3) == 1
+  @test meet(reach, 1,2) == 1
+  @test meet(reach, 3,4) == 3
+  @test meet(reach, 1, 4) == 1
+  @test meet(reach, 1, 1) == 1
+  @test meet(reach, 2, 2) == 2
 end
 
 # ## Another Example:
@@ -173,18 +163,19 @@ to_graphviz(P)
 # Or, as tables:
 
 g = FreeDiagram(P)
+reach = reachability(g)
 
 # ### Test suite
 
 @testset "meets2" begin
-  @test meet(g, 2,3) == 1
-  @test meet(g, 1,2) == 1
-  @test meet(g, 3,4) == 3
-  @test meet(g, 1, 4) == 1
-  @test meet(g, 1, 1) == 1
-  @test meet(g, 2, 2) == 2
-  @test meet(g, 3, 5) == nothing
-  @test meet(g, 2, 5) == 5
+  @test meet(reach, 2,3) == 1
+  @test meet(reach, 1,2) == 1
+  @test meet(reach, 3,4) == 3
+  @test meet(reach, 1, 4) == 1
+  @test meet(reach, 1, 1) == 1
+  @test meet(reach, 2, 2) == 2
+  @test meet(reach, 3, 5) == nothing
+  @test meet(reach, 2, 5) == 5
 end
 
 # ### Exercise 3
